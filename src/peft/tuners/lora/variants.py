@@ -1629,7 +1629,54 @@ class BoraLinearVariant(LoraVariant):
             place_on_cpu=place_on_cpu,
         )
         module.lora_magnitude_vector[adapter_name] = bora_layer
+    @staticmethod
+    def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+        bora_layer = module.lora_magnitude_vector[active_adapter]
 
+        # a and b have to be based on the unmerged weight, the same way `forward` computes them
+        with module._unmerged_base_weight(safe_merge=True) as base_weight:
+            a, b = bora_layer.get_scale_factors(
+                base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1
+            )
+        a, b = a.detach(), b.detach()
+        # `merge` copied the weight before the replay rebuilt it, so carry on from the rebuilt one.
+        orig_weight = dequantize_module_weight(module.get_base_layer())
+        # a and b are needed to unmerge, they cannot be recomputed from the merged weight
+        module._cache_store(f"{active_adapter}-bora-factors", (a, b))
+
+        w_prime = transpose(orig_weight + delta_weight, module.fan_in_fan_out)
+        new_weight = transpose(a[:, None] * w_prime * b[None, :], module.fan_in_fan_out)
+        return new_weight.to(orig_dtype)
+
+    @staticmethod
+    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> None:
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+        bora_layer = module.lora_magnitude_vector[active_adapter]
+
+        with module._unmerged_base_weight() as base_weight:
+            a, b = bora_layer.get_scale_factors(
+                base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1
+            )
+        a, b = a.detach(), b.detach()
+        module._cache_store(f"{active_adapter}-bora-factors", (a, b))
+
+        w_prime = transpose(orig_weight.data + delta_weight, module.fan_in_fan_out)
+        new_weight = transpose(a[:, None] * w_prime * b[None, :], module.fan_in_fan_out)
+        orig_weight.data.copy_(new_weight.to(orig_dtype))
+
+    @staticmethod
+    def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+        a, b = module._cache_pop(f"{active_adapter}-bora-factors")
+
+        merged = transpose(orig_weight.data, module.fan_in_fan_out)
+        w_prime = merged / a[:, None] / b[None, :]
+        new_weight = transpose(w_prime, module.fan_in_fan_out) - delta_weight
+        return new_weight.to(orig_dtype)
     @staticmethod
     def forward(
         module: Linear,
