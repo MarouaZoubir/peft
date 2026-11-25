@@ -28,7 +28,14 @@ from peft.utils.other import infer_device, transpose
 
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
-from .dora import DoraConv1dLayer, DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer
+from .dora import (
+    BoraLinearLayer,
+    DoraConv1dLayer,
+    DoraConv2dLayer,
+    DoraConv3dLayer,
+    DoraEmbeddingLayer,
+    DoraLinearLayer,
+)
 from .layer import Conv1d, Conv2d, Conv3d, Embedding, Linear, LoraLayer, LoraVariant, _ConvNd
 from .monteclora import MontecloraSampler
 from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _reshape_to_grouped_subtokens
@@ -1594,3 +1601,31 @@ def _kasa_layer_regularization_loss(module: Linear, adapter_name: str, beta: flo
     l3 = torch.linalg.norm(gram_B - eye) + torch.linalg.norm(gram_A - eye)
 
     return beta * l2 + gamma * l3
+
+class BoraLinearVariant(LoraVariant):
+    @staticmethod
+    def init(module: Linear, adapter_name: str, **kwargs: Any) -> None:
+        if not module.lora_magnitude_vector:
+            # first bora layer being added, add lora_magnitude_vector to the list of learnable parameters
+            module.adapter_layer_names = module.adapter_layer_names[:] + ("lora_magnitude_vector",)
+
+        bora_layer = BoraLinearLayer(fan_in_fan_out=getattr(module, "fan_in_fan_out", False))
+        lora_A = module.lora_A[adapter_name].weight
+        lora_B = module.lora_B[adapter_name].weight
+        place_on_cpu = module.ephemeral_gpu_offload and (lora_A.device.type == "cpu" or lora_B.device.type == "cpu")
+        if module.ephemeral_gpu_offload:
+            if lora_A.device.type in ["cuda", "xpu", "npu"]:
+                lora_B = lora_B.to(lora_A.device)
+            else:
+                if lora_B.device.type not in ["cuda", "xpu", "npu"]:
+                    lora_B = lora_B.to(infer_device())
+                lora_A = lora_A.to(lora_B.device)
+        scaling = module.scaling[adapter_name]
+        bora_layer.update_layer(
+            base_layer=module.get_base_layer(),
+            lora_A=lora_A,
+            lora_B=lora_B,
+            scaling=scaling,
+            place_on_cpu=place_on_cpu,
+        )
+        module.lora_magnitude_vector[adapter_name] = bora_layer
