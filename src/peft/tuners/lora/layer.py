@@ -1042,7 +1042,7 @@ class Linear(nn.Module, LoraLayer):
         return {
             (): None,
             ("use_dora",): variants.DoraLinearVariant,
-            ("use_bora",):variants.BoraLinearVariant,
+            ("use_bora",): variants.BoraLinearVariant,
             ("arrow_config",): variants.ArrowLinearVariant,
             ("use_bdlora",): variants.BdLoraLinearVariant,
             ("alora_invocation_tokens",): variants.ALoraLinearVariant,

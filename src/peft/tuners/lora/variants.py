@@ -1602,6 +1602,7 @@ def _kasa_layer_regularization_loss(module: Linear, adapter_name: str, beta: flo
 
     return beta * l2 + gamma * l3
 
+
 class BoraLinearVariant(LoraVariant):
     @staticmethod
     def init(module: Linear, adapter_name: str, **kwargs: Any) -> None:
@@ -1629,6 +1630,7 @@ class BoraLinearVariant(LoraVariant):
             place_on_cpu=place_on_cpu,
         )
         module.lora_magnitude_vector[adapter_name] = bora_layer
+
     @staticmethod
     def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = orig_weight.dtype
@@ -1637,9 +1639,7 @@ class BoraLinearVariant(LoraVariant):
 
         # a and b have to be based on the unmerged weight, the same way `forward` computes them
         with module._unmerged_base_weight(safe_merge=True) as base_weight:
-            a, b = bora_layer.get_scale_factors(
-                base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1
-            )
+            a, b = bora_layer.get_scale_factors(base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
         a, b = a.detach(), b.detach()
         # `merge` copied the weight before the replay rebuilt it, so carry on from the rebuilt one.
         orig_weight = dequantize_module_weight(module.get_base_layer())
@@ -1657,9 +1657,7 @@ class BoraLinearVariant(LoraVariant):
         bora_layer = module.lora_magnitude_vector[active_adapter]
 
         with module._unmerged_base_weight() as base_weight:
-            a, b = bora_layer.get_scale_factors(
-                base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1
-            )
+            a, b = bora_layer.get_scale_factors(base_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
         a, b = a.detach(), b.detach()
         module._cache_store(f"{active_adapter}-bora-factors", (a, b))
 
@@ -1677,6 +1675,7 @@ class BoraLinearVariant(LoraVariant):
         w_prime = merged / a[:, None] / b[None, :]
         new_weight = transpose(w_prime, module.fan_in_fan_out) - delta_weight
         return new_weight.to(orig_dtype)
+
     @staticmethod
     def forward(
         module: Linear,
