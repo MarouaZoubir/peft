@@ -267,3 +267,26 @@ class DoraConv2dLayer(_DoraConvNdLayer):
 
 class DoraConv3dLayer(_DoraConvNdLayer):
     pass
+class BoraLinearLayer(DoraLinearLayer):
+    """
+    Magnitude parameters of BoRA for a linear layer.
+
+    `self.weight` is the row magnitude `m_r` (one value per output feature, same as DoRA), `self.weight_col` is the
+    column magnitude `m_c` (one value per input feature).
+    """
+
+    def update_layer(self, *, base_layer, lora_A, lora_B, scaling, place_on_cpu=False) -> None:
+        # DoRA's update_layer creates self.weight: the row norms of W' = W0 + scaling * (B @ A). This is m_r.
+        super().update_layer(
+            base_layer=base_layer, lora_A=lora_A, lora_B=lora_B, scaling=scaling, place_on_cpu=place_on_cpu
+        )
+
+        # m_c: the column norms of the same W', so that the layer is identical to the base layer at initialization.
+        with gather_params_ctx(base_layer.parameters()):
+            weight = transpose(dequantize_module_weight(base_layer), self.fan_in_fan_out)
+            lora_weight = lora_B @ lora_A
+            col_norm = torch.linalg.norm(weight.to(lora_A.device) + scaling * lora_weight, dim=0).to(weight.dtype)
+
+        if place_on_cpu:
+            col_norm = col_norm.to("cpu")
+        self.weight_col = nn.Parameter(col_norm.detach(), requires_grad=True)
