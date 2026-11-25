@@ -290,3 +290,19 @@ class BoraLinearLayer(DoraLinearLayer):
         if place_on_cpu:
             col_norm = col_norm.to("cpu")
         self.weight_col = nn.Parameter(col_norm.detach(), requires_grad=True)
+
+    def get_scale_factors(self, weight, lora_weight, scaling):
+        """
+        Compute the two scaling vectors of BoRA, such that W = diag(a) @ (W0 + scaling * lora_weight) @ diag(b).
+
+        `weight` is the base weight in the layout of the base layer, `lora_weight` has the shape (out, in). The norms
+        are treated as constants during backpropagation (as done for DoRA), so gradients only reach `self.weight`
+        (m_r) and `self.weight_col` (m_c).
+        """
+        weight = transpose(weight, self.fan_in_fan_out)
+        w_prime = weight + scaling * lora_weight
+        row_norm = torch.linalg.norm(w_prime, dim=1).detach()
+        a = self.weight / row_norm
+        col_norm = torch.linalg.norm(a.detach()[:, None] * w_prime, dim=0).detach()
+        b = self.weight_col / col_norm
+        return a, b

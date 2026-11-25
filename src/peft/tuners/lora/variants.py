@@ -1629,3 +1629,31 @@ class BoraLinearVariant(LoraVariant):
             place_on_cpu=place_on_cpu,
         )
         module.lora_magnitude_vector[adapter_name] = bora_layer
+
+    @staticmethod
+    def forward(
+        module: Linear,
+        active_adapter: str,
+        x: torch.Tensor,
+        result: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        lora_A = module.lora_A[active_adapter]
+        lora_B = module.lora_B[active_adapter]
+        dropout = module.lora_dropout[active_adapter]
+        scaling = module.scaling[active_adapter]
+        bora_layer = module.lora_magnitude_vector[active_adapter]
+        base_layer = module.get_base_layer()
+
+        weight = dequantize_module_weight(base_layer).to(x.dtype)
+        lora_weight = bora_layer.get_lora_weight(lora_A=lora_A, lora_B=lora_B, adapter_name=active_adapter)
+        lora_weight = lora_weight.to(x.dtype)
+        a, b = bora_layer.get_scale_factors(weight, lora_weight.detach(), scaling)
+
+        x_b = x * b
+        out = F.linear(x_b, transpose(weight, module.fan_in_fan_out))
+        out = out + lora_B(lora_A(dropout(x_b))) * scaling
+        out = out * a
+        if base_layer.bias is not None:
+            out = out + base_layer.bias
+        return out.to(result.dtype)
