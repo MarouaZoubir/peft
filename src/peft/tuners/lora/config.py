@@ -637,6 +637,11 @@ class LoraConfig(PeftConfig):
             ranks. Right now, DoRA only supports linear and Conv2D layers. DoRA introduces a bigger overhead than pure
             LoRA, so it is recommended to merge weights for inference. For more information, see
             https://huggingface.co/papers/2402.09353.
+        use_bora (`bool`):
+            Enable 'Bi-dimensional Weight-Decomposed Low-Rank Adaptation' (BoRA). BoRA extends DoRA with two learnable
+            magnitude vectors, one per row and one per column of the weight matrix. Right now, BoRA only supports
+            linear layers and cannot be combined with `use_dora`. For more information, see
+            https://huggingface.co/papers/2412.06441.
         velora_config (`Optional[VeloraConfig]`):
             Enable VeLoRA by providing a VeloraConfig. VeLoRA swaps in a custom backward pass for the LoRA A projection
             that stores compressed activations instead of the full input activations.
@@ -936,6 +941,18 @@ class LoraConfig(PeftConfig):
                 "magnitude is handled by a separate learnable parameter. This can improve the performance of LoRA, "
                 "especially at low ranks. Right now, DoRA only supports linear and Conv2D layers. DoRA introduces a bigger"
                 "overhead than pure LoRA, so it is recommended to merge weights for inference."
+            ),
+            "is_lora_variant": True,
+        },
+    )
+    use_bora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable <a href='https://huggingface.co/papers/2412.06441'>'Bi-dimensional Weight-Decomposed "
+                "Low-Rank Adaptation' (BoRA)</a>. This technique extends DoRA by learning two magnitude vectors, one "
+                "for the rows and one for the columns of the weight matrix. Right now, BoRA only supports linear "
+                "layers and cannot be combined with `use_dora`."
             ),
             "is_lora_variant": True,
         },
