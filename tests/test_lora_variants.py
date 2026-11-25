@@ -29,6 +29,7 @@ from peft.tuners.lora.layer import Linear as LoraLinear
 from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.lora.variants import (
     ALoraLinearVariant,
+    BoraLinearVariant,
     DoraConv1dVariant,
     DoraConv2dVariant,
     DoraEmbeddingVariant,
@@ -131,6 +132,9 @@ VARIANT_MAP = {
     "kasa": {
         LoraLinear: KasaLinearVariant,
     },
+    "bora": {
+        LoraLinear: BoraLinearVariant,
+    },
 }
 
 
@@ -149,6 +153,11 @@ TEST_CASES = [
         "kasa",
         LoraConfig,
         {"target_modules": ["linear1", "linear2"], "kasa_config": KasaConfig(), "r": 4},
+    ),
+    (
+        "bora",
+        LoraConfig,
+        {"target_modules": ["linear1", "linear2"], "use_bora": True},
     ),
 ]
 
@@ -250,6 +259,97 @@ class TestLoraVariants:
                 match=".*found in lora_variant.*",
             ):
                 layer.resolve_lora_variant(config=config)
+
+    def test_bora_params_have_gradients(self):
+        """Ensure that both magnitude vectors added by the BoRA variant participate in the output computation."""
+        layer_names = ["linear1", "linear2"]
+        peft_config = LoraConfig(target_modules=layer_names, use_bora=True)
+        _, peft_model = self.custom_model_with_loss_backpropagated(peft_config)
+
+        for layer in layer_names:
+            bora_layer = getattr(peft_model.base_model.model, layer).lora_magnitude_vector["default"]
+            # m_r (per output feature) and m_c (per input feature)
+            assert bora_layer.weight.grad is not None
+            assert bora_layer.weight_col.grad is not None
+
+    def test_bora_matches_base_layer_at_initialization(self):
+        # With lora_B = 0 and the magnitudes initialized to the row/column norms of the weight, BoRA must not change
+        # the output of the base model.
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(5, 8))
+        x = torch.randn(7, 5)
+        expected = model(x)
+
+        peft_model = get_peft_model(model, LoraConfig(target_modules=["0"], r=3, use_bora=True)).eval()
+        with torch.no_grad():
+            assert torch.allclose(peft_model(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_bora_forward_matches_reference_formula(self):
+        # W = diag(m_r / ||W'||_row) @ W' scaled so that the columns of the result have norm m_c, where
+        # W' = W0 + scaling * B @ A. Non-square weight, non-zero B and perturbed magnitudes, so that mixing up rows
+        # and columns would be noticed.
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(5, 8))
+        peft_model = get_peft_model(model, LoraConfig(target_modules=["0"], r=3, lora_alpha=6, use_bora=True)).eval()
+        layer = peft_model.base_model.model[0]
+        bora_layer = layer.lora_magnitude_vector["default"]
+        lora_A = layer.lora_A["default"].weight
+        lora_B = layer.lora_B["default"].weight
+
+        with torch.no_grad():
+            lora_B.normal_()
+            bora_layer.weight.add_(0.5 * torch.rand_like(bora_layer.weight))
+            bora_layer.weight_col.add_(0.5 * torch.rand_like(bora_layer.weight_col))
+
+            w_prime = layer.base_layer.weight + layer.scaling["default"] * (lora_B @ lora_A)
+            m = (bora_layer.weight / w_prime.norm(dim=1))[:, None] * w_prime
+            expected_weight = m * (bora_layer.weight_col / m.norm(dim=0))[None, :]
+
+            x = torch.randn(7, 5)
+            expected = x @ expected_weight.T + layer.base_layer.bias
+            assert torch.allclose(peft_model(x), expected, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize("fan_in_fan_out", [False, True])
+    @pytest.mark.parametrize("safe_merge", [False, True])
+    @pytest.mark.parametrize("out_features, in_features", [(6, 6), (8, 4)])
+    def test_bora_merge_matches_unmerged_and_unmerge_inverts(
+        self, out_features, in_features, safe_merge, fan_in_fan_out
+    ):
+        # Merging must not change the output, and unmerging must restore the original weights. This is tested for a
+        # regular Linear layer and for a transformers Conv1D (fan_in_fan_out), where rows and columns of the stored
+        # weight are swapped. The magnitudes and lora_B are perturbed to emulate a trained adapter.
+        torch.manual_seed(0)
+        if fan_in_fan_out:
+            model = ModelWithConv1D(out_features, in_features)
+            target = "c"
+        else:
+            model = nn.Sequential(nn.Linear(in_features, out_features))
+            target = "0"
+        config = LoraConfig(target_modules=[target], use_bora=True, fan_in_fan_out=fan_in_fan_out)
+        peft_model = get_peft_model(model, config).eval()
+        layer = peft_model.base_model.model.get_submodule(target)
+        bora_layer = layer.lora_magnitude_vector["default"]
+
+        with torch.no_grad():
+            layer.lora_B["default"].weight.normal_()
+            bora_layer.weight.add_(0.5 * torch.rand_like(bora_layer.weight))
+            bora_layer.weight_col.add_(0.5 * torch.rand_like(bora_layer.weight_col))
+
+            x = torch.randn(3, in_features)
+            original_weight = layer.base_layer.weight.detach().clone()
+            expected = layer(x)
+
+            layer.merge(safe_merge=safe_merge)
+            assert torch.allclose(layer(x), expected, atol=1e-4, rtol=1e-4)
+
+            layer.unmerge()
+            assert torch.allclose(layer.base_layer.weight, original_weight, atol=1e-4, rtol=1e-4)
+            assert torch.allclose(layer(x), expected, atol=1e-4, rtol=1e-4)
+
+    def test_bora_and_dora_cannot_be_combined(self):
+        model = nn.Sequential(nn.Linear(4, 6))
+        with pytest.raises(ValueError, match="Invalid or unsupported variant combination"):
+            get_peft_model(model, LoraConfig(target_modules=["0"], use_dora=True, use_bora=True))
 
     def test_invalid_variant_combination_raises_error(self):
         # 1. Create a config with no variants active
